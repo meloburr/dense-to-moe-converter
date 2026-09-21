@@ -7,6 +7,59 @@ LLaMA/Qwen-style checkpoints.
 
 This is an independent implementation, not the authors' official code.
 
+## Why convert a dense model?
+
+A dense transformer evaluates every feed-forward neuron for every token. A
+Mixture-of-Experts model keeps the full parameter capacity, but routes each
+token through only a subset of those neurons. DOT-MoE performs that conversion
+without randomly splitting the FFN or permanently pruning weights. Instead, it
+learns which neurons should form an expert at the same time as it learns which
+tokens should use that expert.
+
+The conversion has two outputs for each transformer layer:
+
+- a balanced neuron-to-expert membership vector; and
+- a token router that selects a fixed number of experts.
+
+Together they allow the original dense FFN weights to be reorganized into
+disjoint experts while preserving the complete source parameter set.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    X[Token hidden states] --> Dense[Original frozen FFN]
+    Dense --> Teacher[Dense teacher logits]
+
+    X --> Router[Trainable token router]
+    Router --> TopK[Top-k routing STE]
+
+    Affinity[Trainable neuron affinities] --> Sinkhorn[Log-domain Sinkhorn]
+    Sinkhorn --> Round[Balanced rounding STE]
+
+    Dense --> Activations[Gate and up activations]
+    TopK --> Mask[Token-by-neuron mask]
+    Round --> Mask
+    Activations --> Mask
+    Mask --> Down[Original frozen down projection]
+    Down --> Student[Sparse student logits]
+
+    Teacher --> Loss[KL + CE + z-loss + balance]
+    Student --> Loss
+    Loss -. gradients .-> Router
+    Loss -. gradients .-> Affinity
+
+    Round --> Export[Materialize disjoint expert weights]
+    Router --> Export
+    Export --> Overlay[Compact MoE overlay]
+```
+
+During alignment, the dense projections remain frozen. Straight-through
+estimators use hard expert decisions in the forward pass while allowing the
+soft Sinkhorn plan and router probabilities to receive gradients. After
+alignment, Sinkhorn and the estimators are removed: inference uses only the
+saved hard membership and router weights.
+
 ## What is reproduced
 
 For every dense FFN, the converter:
@@ -24,6 +77,28 @@ For every dense FFN, the converter:
 The saved checkpoint is a compact overlay: expert membership plus router
 weights. It never modifies or redistributes the source model weights.
 
+### Balanced assignment
+
+Each neuron supplies one unit of transport mass and every expert must receive
+exactly `intermediate_size / expert_count` neurons. Log-domain Sinkhorn
+normalization produces a differentiable soft transport plan with those row and
+column marginals. Greedy rounding then converts the plan into an exactly
+balanced binary assignment.
+
+### Joint routing alignment
+
+The token router and neuron assignment are trained together. The sparse
+student is compared with the original dense model using output-distribution KL
+divergence and language-model cross-entropy. Router z-loss limits unstable
+logits, while the load-balancing term discourages expert collapse.
+
+### Export
+
+For expert `e`, the converter gathers the corresponding rows from `gate_proj`
+and `up_proj`, and the matching columns from `down_proj`. The original model is
+not overwritten; loading an overlay reconstructs these experts from the pinned
+source checkpoint.
+
 ## Quick verification
 
 ```bash
@@ -40,6 +115,13 @@ frozen dense weights, dtype preservation, masked-to-materialized export
 equivalence, and full-model logits when every expert is active.
 
 ## Convert a model
+
+Two profiles are provided:
+
+| Profile | Purpose | Default steps | Sequence length | Training data |
+|---|---|---:|---:|---|
+| `smoke` | Verify the complete pipeline on accessible hardware | 10 | 128 | WikiText-2 |
+| `paper` | Match the reported alignment hyperparameters | 3,500 | 2,048 | Dolmino Mix |
 
 The smoke profile validates the complete conversion pipeline with a small data
 and step budget. It is not expected to reproduce the paper's scores:
@@ -88,6 +170,16 @@ outputs/qwen2.5-7b-dot-moe/
 ├── ...
 └── layer_27.safetensors
 ```
+
+| File | Contents |
+|---|---|
+| `recipe.json` | Source revision, topology, profile, dataset, and runtime settings |
+| `alignment_metrics.json` | Per-layer expert counts and alignment diagnostics |
+| `report.json` | Dense and converted evaluation results plus a generation sample |
+| `layer_XX.safetensors` | Hard neuron membership and trained router for one layer |
+
+The source checkpoint is intentionally not copied into the output directory.
+This keeps overlays small and avoids redistributing third-party model weights.
 
 Load, evaluate, or generate from an overlay with:
 
