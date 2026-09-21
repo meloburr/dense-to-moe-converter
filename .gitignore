@@ -1,0 +1,19 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.env
+*.log
+
+# Generated model overlays and training runs. Qwen weights are never vendored.
+qwen35_*/
+smoke_global_dot*/
+outputs/
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.bin
